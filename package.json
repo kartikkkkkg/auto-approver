@@ -1,0 +1,11 @@
+{
+  "name": "auto-approver",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node approve.js requests.csv"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}

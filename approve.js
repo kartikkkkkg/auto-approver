@@ -1,8 +1,15 @@
 /**
- * approve.js (robust)
- * - Improved switchUser with multiple strategies
- * - Saves screenshots on error to logs/errors/
- * - Does not auto-close browser on fatal error so you can inspect
+ * approve.js - updated for custom dropdown (Select... -> Eder, Noelle)
+ *
+ * Usage:
+ *   node approve.js requests.csv
+ *
+ * Behavior:
+ *  - launches Edge with your profile
+ *  - goes to configured URL
+ *  - ensures view switches to Noelle (Eder, Noelle)
+ *  - searches & batch-approves requests
+ *  - on failures saves screenshots to logs/errors/
  */
 
 import fs from "fs";
@@ -22,45 +29,32 @@ const ERR_DIR = path.join(LOGS_DIR, "errors");
 ensureDir(LOGS_DIR);
 ensureDir(ERR_DIR);
 
-/* -------------------------
-   Profile helper
--------------------------- */
 function userDataDir() {
   return `C:\\Users\\${cfg.edgeProfileUser}\\AppData\\Local\\Microsoft\\Edge\\User Data`;
 }
 
-/* -------------------------
-   Start browser (persistent)
--------------------------- */
 async function startBrowser() {
   const profile = userDataDir();
   try {
     if (fs.existsSync(profile)) {
-      const context = await chromium.launchPersistentContext(profile, {
+      return await chromium.launchPersistentContext(profile, {
         headless: false,
         channel: "msedge",
-        viewport: { width: 1500, height: 900 }
+        viewport: { width: 1400, height: 900 }
       });
-      return context;
     }
   } catch (e) {
     console.warn("Persistent context failed:", e.message);
   }
   const browser = await chromium.launch({ headless: false, channel: "msedge" });
-  return await browser.newContext({ viewport: { width: 1500, height: 900 } });
+  return await browser.newContext({ viewport: { width: 1400, height: 900 } });
 }
 
-/* -------------------------
-   Navigation
--------------------------- */
 async function gotoHome(page) {
   await page.goto(cfg.urls.homeNoelle, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle");
 }
 
-/* -------------------------
-   Utilities
--------------------------- */
 async function safeScreenshot(page, nameSuffix = "") {
   try {
     const filename = path.join(ERR_DIR, `${ts().replace(/[: ]/g,"")}${nameSuffix}.png`);
@@ -68,7 +62,7 @@ async function safeScreenshot(page, nameSuffix = "") {
     console.log("Saved screenshot:", filename);
     return filename;
   } catch (e) {
-    console.warn("Screenshot failed:", e.message);
+    console.warn("screenshot failed:", e.message);
     return null;
   }
 }
@@ -77,10 +71,9 @@ async function saveText(name, text) {
   try {
     const p = path.join(ERR_DIR, name);
     fs.writeFileSync(p, text);
-    console.log("Saved text:", p);
     return p;
   } catch (e) {
-    console.warn("Save text failed:", e.message);
+    console.warn("saveText failed:", e.message);
     return null;
   }
 }
@@ -96,162 +89,126 @@ async function clickIf(page, selector) {
   return false;
 }
 
-/* -------------------------
-   Robust switchUser
-   multiple strategies tried in order:
-   1) native selectOption
-   2) set value + dispatchEvent via page.evaluate
-   3) find option element and click via JS
-   4) click visible text fallback
--------------------------- */
+/* --------------------------
+   NEW: robust switchUser for custom dropdown
+   - clicks Switch link
+   - clicks the dropdown opener (Select... or caret)
+   - waits for list and clicks the exact option text (who)
+--------------------------- */
 async function switchUser(page, who) {
-  console.log(`→ switchUser: selecting "${who}"`);
+  console.log(`→ switchUser: choose "${who}"`);
 
-  // open dialog
+  // open the Switch dialog
   await clickIf(page, cfg.sel.switchLink);
   await sleep(300);
 
-  // wait for dialog to appear
+  // wait for dialog to appear (text from screenshots)
   await page.waitForSelector('text=Switch View', { timeout: 6000 }).catch(()=>{});
 
-  // Wait for any select to appear inside the dialog
-  const selectHandle = await page.locator('div[role="dialog"] select, select').first();
-  try {
-    await selectHandle.waitFor({ timeout: 3000 });
-  } catch (e) {
-    // not found quickly — continue anyway
+  // Strategy: click the visible "Select..." area or the caret icon
+  // Try a few selectors that match the UI from your screenshots.
+  const openerCandidates = [
+    'div[role="dialog"] >> text="Select..."',
+    'div[role="dialog"] >> text=Select',
+    'div[role="dialog"] >> .select__control', // generic
+    'div[role="dialog"] >> button[aria-haspopup="listbox"]',
+    'div[role="dialog"] >> [role="combobox"]',
+    'div[role="dialog"] >> svg', // click caret as last resort
+    'select' // fallback if it's actually a select (rare)
+  ];
+
+  let opened = false;
+  for (const s of openerCandidates) {
+    try {
+      const loc = page.locator(s);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        opened = true;
+        await sleep(220);
+        break;
+      }
+    } catch (e) {
+      // ignore and continue
+    }
   }
 
-  // Strategy A: native selectOption (preferred)
-  try {
-    const selCount = await page.locator('div[role="dialog"] select, select').count();
-    if (selCount > 0) {
-      console.log(" -> Found native <select>, trying page.selectOption by label");
-      const res = await page.selectOption('div[role="dialog"] select, select', { label: who }).catch(e => { throw e; });
-      // selectOption returns [] or value; check current value
-      await sleep(300);
-      // verify selection
-      const selected = await page.evaluate(() => {
-        const sel = document.querySelector('div[role="dialog"] select, select');
-        return sel ? sel.options[sel.selectedIndex].textContent.trim() : "";
-      });
-      console.log("   selected text (after selectOption):", selected);
-      if (selected && selected.includes(who.split(",")[0])) {
-        console.log("   selectOption succeeded");
+  // If we couldn't open dropdown, try clicking the right-side caret area position
+  if (!opened) {
+    try {
+      // try clicking near the right side of dialog where caret sits
+      const dialog = page.locator('div[role="dialog"]').first();
+      if (await dialog.count()) {
+        const box = await dialog.boundingBox();
+        if (box) {
+          // click near top-right inside dialog where caret is visible in screenshots
+          await page.mouse.click(box.x + box.width - 60, box.y + 60, { force: true });
+          opened = true;
+          await sleep(250);
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Wait a short while for options to appear
+  await sleep(220);
+
+  // Candidate selectors for the list / items (custom lists often use role=listbox/option or plain divs)
+  const optionSelectors = [
+    `div[role="option"]:has-text("${who}")`,
+    `div[role="listbox"] >> text="${who}"`,
+    `div[role="dialog"] >> text="${who}"`,
+    `text="${who}"`,
+    `li:has-text("${who}")`,
+    `div:has-text("${who}")`
+  ];
+
+  // Try to click the exact label
+  for (const sel of optionSelectors) {
+    try {
+      const loc = page.locator(sel);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        console.log("   clicked option via selector:", sel);
+        await sleep(150);
         await clickIf(page, cfg.sel.switchConfirm);
         await page.waitForLoadState("networkidle").catch(()=>{});
         await sleep(600);
         return;
-      } else {
-        console.log("   selectOption did not choose expected label, will try DOM set");
       }
-    } else {
-      console.log(" -> No native select found (selCount=0)");
+    } catch (e) {
+      // continue
     }
-  } catch (e) {
-    console.warn("selectOption attempt failed:", e.message);
   }
 
-  // Strategy B: set value + dispatch change using DOM (works even if selectOption doesn't)
-  try {
-    console.log(" -> Trying DOM method: set select.value and dispatchEvent");
-    const setResult = await page.evaluate((whoText) => {
-      const sel = document.querySelector('div[role="dialog"] select, select');
-      if (!sel) return { ok: false, msg: "no select element" };
-      // find option index by text match
-      let foundIndex = -1;
-      for (let i = 0; i < sel.options.length; i++) {
-        const t = (sel.options[i].text || "").trim();
-        if (t === whoText || t.includes(whoText.split(",")[0])) { foundIndex = i; break; }
+  // If exact label not found, try partial match by first name (Eder or Garrido etc)
+  const firstName = who.split(",")[0].trim();
+  const partialCandidates = [
+    `div[role="option"]:has-text("${firstName}")`,
+    `div[role="dialog"] >> text=${firstName}`,
+    `text=${firstName}`
+  ];
+  for (const sel of partialCandidates) {
+    try {
+      const loc = page.locator(sel);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        await sleep(120);
+        await clickIf(page, cfg.sel.switchConfirm);
+        await page.waitForLoadState("networkidle").catch(()=>{});
+        await sleep(600);
+        return;
       }
-      if (foundIndex === -1) return { ok: false, msg: "option not found" };
-      sel.selectedIndex = foundIndex;
-      const ev = new Event('change', { bubbles: true });
-      sel.dispatchEvent(ev);
-      return { ok: true, idx: foundIndex, label: sel.options[foundIndex].text };
-    }, who);
-    if (setResult && setResult.ok) {
-      console.log("   DOM set succeeded, selected:", setResult.label);
-      await clickIf(page, cfg.sel.switchConfirm);
-      await page.waitForLoadState("networkidle").catch(()=>{});
-      await sleep(600);
-      return;
-    } else {
-      console.log("   DOM set did not find option:", setResult && setResult.msg);
-    }
-  } catch (e) {
-    console.warn("DOM set attempt failed:", e.message);
+    } catch (e) {}
   }
 
-  // Strategy C: locate option element and click it via JS (useful on some UIs)
-  try {
-    console.log(" -> Trying to click option element via JS");
-    const clicked = await page.evaluate((whoText) => {
-      const sel = document.querySelector('div[role="dialog"] select, select');
-      if (!sel) return false;
-      for (let i = 0; i < sel.options.length; i++) {
-        const t = (sel.options[i].text || "").trim();
-        if (t === whoText || t.includes(whoText.split(",")[0])) {
-          // create a MouseEvent on the option (some browsers ignore click on option)
-          const opt = sel.options[i];
-          try {
-            opt.selected = true;
-            const evt = new Event('change', { bubbles: true });
-            sel.dispatchEvent(evt);
-            return true;
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-      return false;
-    }, who);
-    if (clicked) {
-      console.log("   JS option click succeeded");
-      await clickIf(page, cfg.sel.switchConfirm);
-      await page.waitForLoadState("networkidle").catch(()=>{});
-      await sleep(600);
-      return;
-    } else {
-      console.log("   JS option click did not find a match");
-    }
-  } catch (e) {
-    console.warn("JS option click failed:", e.message);
-  }
-
-  // Strategy D (last resort): click visible text nodes inside dialog
-  try {
-    const firstName = who.split(",")[0].trim();
-    console.log(" -> Trying visible-text click for:", firstName);
-    const textLocator = page.locator(`div[role="dialog"] >> text="${who}"`);
-    if ((await textLocator.count()) > 0) {
-      await textLocator.first().click({ force: true });
-      await clickIf(page, cfg.sel.switchConfirm);
-      await page.waitForLoadState("networkidle").catch(()=>{});
-      await sleep(600);
-      return;
-    }
-    // partial match
-    const partialLocator = page.locator(`div[role="dialog"] >> text=${firstName}`);
-    if ((await partialLocator.count()) > 0) {
-      await partialLocator.first().click({ force: true });
-      await clickIf(page, cfg.sel.switchConfirm);
-      await page.waitForLoadState("networkidle").catch(()=>{});
-      await sleep(600);
-      return;
-    }
-  } catch (e) {
-    console.warn("visible-text fallback failed:", e.message);
-  }
-
-  // If all strategies failed: save state and throw for inspection
+  // Nothing worked: capture screenshot and throw for debugging
   const shot = await safeScreenshot(page, "-switch-failed");
   await saveText("switch-error.txt", `Could not select "${who}" in Switch dialog. Screenshot: ${shot}\n`);
   throw new Error(`switchUser: unable to programmatically select "${who}". Screenshot: ${shot}`);
 }
 
 /* -------------------------
-   search helpers
+   search & select helpers
 -------------------------- */
 async function clearSearch(page) {
   try {
@@ -270,16 +227,17 @@ async function selectBySearch(page, id) {
   await page.fill(cfg.sel.searchInput, id);
   for (let i = 0; i < 15; i++) {
     await sleep(250);
-    const count = await page.locator(cfg.sel.rowById(id)).count().catch(()=>0);
-    if (count > 0) {
+    const rowCount = await page.locator(cfg.sel.rowById(id)).count().catch(()=>0);
+    if (rowCount > 0) {
       try {
         await page.check(cfg.sel.rowCheckbox(id));
         return true;
       } catch {
+        // try clicking row and then checkbox
         const row = page.locator(cfg.sel.rowById(id)).first();
-        await row.click({ position: { x: 20, y: 10 } }).catch(()=>{});
+        await row.click({ position: { x: 20, y: 12 } }).catch(()=>{});
         try { await page.check(cfg.sel.rowCheckbox(id)); return true; } catch {}
-        return true; // still consider found
+        return true;
       }
     }
   }
@@ -288,24 +246,18 @@ async function selectBySearch(page, id) {
 
 async function bulkApprove(page) {
   await page.click(cfg.sel.bulkApproveBtn);
-  await sleep(400);
+  await sleep(300);
   await clickIf(page, cfg.sel.approveConfirmBtn);
-  await sleep(1000);
+  await sleep(900);
 }
 
-/* -------------------------
-   batch approval
--------------------------- */
 async function batchApproveInUser(page, ids, batchSize = cfg.batchSize) {
   const remaining = new Set(ids);
   while (remaining.size > 0) {
     let selected = 0;
     for (const id of [...remaining]) {
       const ok = await selectBySearch(page, id);
-      if (ok) {
-        remaining.delete(id);
-        selected++;
-      }
+      if (ok) { remaining.delete(id); selected++; }
       if (selected >= batchSize) break;
     }
     if (selected === 0) break;
@@ -316,14 +268,11 @@ async function batchApproveInUser(page, ids, batchSize = cfg.batchSize) {
 }
 
 /* -------------------------
-   MAIN with error capture (keeps browser open on failure)
+   MAIN
 -------------------------- */
 async function main() {
   const input = process.argv[2] || "requests.csv";
-  if (!fs.existsSync(input)) {
-    console.error("requests.csv not found");
-    return;
-  }
+  if (!fs.existsSync(input)) { console.error("requests.csv missing"); return; }
   const ids = readRequests(input);
   const outPath = path.join(LOGS_DIR, `run-${ts().replace(/[: ]/g,"")}.csv`);
   appendLog(outPath, "time,request_id,result,notes\n");
@@ -334,15 +283,11 @@ async function main() {
   try {
     await gotoHome(page);
 
-    // ensure Noelle first
+    // Check active user snapshot (simple text search)
     const body = await page.textContent("body").catch(()=>"");
     if (!body.includes("Eder")) {
-      if (body.includes("Gupta")) await switchUser(page, cfg.users.noelle);
-      else if (body.includes("Garrido")) await switchUser(page, cfg.users.noelle);
-      else {
-        // if ambiguous, attempt to switch anyway
-        await switchUser(page, cfg.users.noelle).catch(e => console.warn("Switch attempt ambiguous:", e.message));
-      }
+      // Ensure we go to Noelle first
+      await switchUser(page, cfg.users.noelle);
     }
 
     console.log("→ Approving in Noelle...");
@@ -351,12 +296,12 @@ async function main() {
     for (const x of approvedNoelle) appendLog(outPath, `${ts()},${x},approved_in_noelle,\n`);
 
     if (notFoundNoelle.length === 0) {
-      console.log("All handled in Noelle.");
+      console.log("Done. Log:", outPath);
       await context.close();
       return;
     }
 
-    console.log("→ Switching to Alvaro for remaining IDs...");
+    console.log("→ Switching to Alvaro...");
     await switchUser(page, cfg.users.alvaro);
 
     const notFoundAlvaro = await batchApproveInUser(page, notFoundNoelle);
@@ -364,7 +309,7 @@ async function main() {
     for (const x of approvedAlvaro) appendLog(outPath, `${ts()},${x},approved_in_alvaro,\n`);
 
     if (approvedAlvaro.length > 0) {
-      console.log("→ Returning to Noelle to finalize chain...");
+      console.log("→ Returning to Noelle for final approvals...");
       await switchUser(page, cfg.users.noelle);
       const retry = await batchApproveInUser(page, approvedAlvaro);
       for (const x of approvedAlvaro) {
@@ -375,17 +320,14 @@ async function main() {
 
     for (const x of notFoundAlvaro) appendLog(outPath, `${ts()},${x},not_found_anywhere,\n`);
 
-    console.log("Done. Log:", outPath);
+    console.log("✔ DONE → Log:", outPath);
     await context.close();
   } catch (err) {
     console.error("Fatal error:", err.message);
     const shot = await safeScreenshot(page, "-fatal");
     await saveText("fatal-error.txt", `${err.stack}\nScreenshot: ${shot}\n`);
-    console.log("Browser left open for inspection. Check logs/errors for screenshot and fatal-error.txt");
-    // Do NOT close context so you can inspect the browser state.
+    console.log("Browser left open for inspection (check logs/errors).");
   }
 }
 
-main().catch(e=>{
-  console.error("Unhandled error:", e);
-});
+main().catch(e => console.error("unhandled:", e));

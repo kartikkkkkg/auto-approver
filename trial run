@@ -1,0 +1,19 @@
+$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
+npm install playwright
+
+
+import { chromium } from "playwright";
+
+(async () => {
+  const context = await chromium.launchPersistentContext(
+    "C:\\Users\\2031146\\AppData\\Local\\Microsoft\\Edge\\User Data",
+    {
+      channel: "msedge",
+      headless: false
+    }
+  );
+
+  const page = await context.newPage();
+  await page.goto("https://example.com");
+  console.log("Edge launched successfully!");
+})();

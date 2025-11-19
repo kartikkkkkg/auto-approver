@@ -1,66 +1,81 @@
 // utils.js
-import fs from "fs";
+// ESM module of general helpers used by approve.js
+
+import fs from "fs/promises";
 import path from "path";
+import { chromium } from "playwright";
 
 /**
- * Ensure directory exists (creates recursively)
+ * Start and return a Playwright browser + context + page.
+ * Options:
+ *   headless: boolean (default: false so you can see what's happening)
+ *   profile: optional path to use for persistent context
  */
-export function ensureDir(dirPath) {
-  try {
-    if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
-  } catch (e) {
-    console.warn("ensureDir failed:", e.message);
+export async function startBrowser({ headless = false, userDataDir = null } = {}) {
+  if (userDataDir) {
+    // persistent context
+    const browser = await chromium.launchPersistentContext(userDataDir, {
+      headless,
+      viewport: { width: 1366, height: 768 },
+      args: ["--start-maximized"],
+    });
+    const pages = browser.pages();
+    const page = pages.length ? pages[0] : await browser.newPage();
+    return { browser, context: browser, page };
+  } else {
+    const browser = await chromium.launch({ headless, args: ["--start-maximized"] });
+    const context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+    const page = await context.newPage();
+    return { browser, context, page };
   }
 }
 
-/**
- * Timestamp string usable in filenames
- */
-export function ts() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-/**
- * Read CSV of requests (simple one-column list or header+one column).
- * Returns array of trimmed IDs (skips blank lines).
- */
-export function readRequests(csvPath) {
-  const txt = fs.readFileSync(csvPath, { encoding: "utf8" });
-  const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  // if file has header that looks like non-numeric first line, ignore first line
-  if (lines.length > 1 && /[A-Za-z]/.test(lines[0]) && !/^\d/.test(lines[0])) {
-    lines.shift();
-  }
-  return lines;
-}
-
-/**
- * Append a single CSV line to a log file
- */
-export function appendLog(filePath, text) {
-  fs.appendFileSync(filePath, text, { encoding: "utf8" });
-}
-
-/**
- * Sleep helper (ms)
- */
-export function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Save a text file to the errors/logs directory (useful for dumps)
- */
-export function saveText(name, text, dir = "logs/errors") {
+export async function ensureDir(dir) {
   try {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const p = path.join(dir, name);
-    fs.writeFileSync(p, text, "utf8");
-    return p;
+    await fs.mkdir(dir, { recursive: true });
+  } catch (e) {}
+}
+
+/** Save a screenshot to logs/errors with timestamp */
+export async function safeScreenshot(page, tag = "") {
+  try {
+    const dir = path.join(process.cwd(), "logs", "errors");
+    await ensureDir(dir);
+    const file = path.join(dir, `error-${Date.now()}${tag ? "-" + tag : ""}.png`);
+    await page.screenshot({ path: file, fullPage: true });
+    console.log("Saved screenshot:", file);
+    return file;
   } catch (e) {
-    console.warn("saveText failed:", e.message);
+    console.warn("safeScreenshot failed:", e?.message);
     return null;
   }
+}
+
+/** Simple logger append (CSV friendly) */
+export async function appendLog(filePath, text) {
+  try {
+    await ensureDir(path.dirname(filePath));
+    await fs.appendFile(filePath, text);
+  } catch (e) {
+    console.warn("appendLog error", e?.message);
+  }
+}
+
+/** Overwrite (create) a file */
+export async function saveText(filePath, text) {
+  try {
+    await ensureDir(path.dirname(filePath));
+    await fs.writeFile(filePath, text);
+  } catch (e) {
+    console.warn("saveText error", e?.message);
+  }
+}
+
+/** Read CSV-ish file of request IDs: one per line, skip blank lines */
+export async function readIdsFromFile(fn) {
+  const raw = await fs.readFile(fn, { encoding: "utf8" });
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  // If CSV-like, allow comma separated in first column -> just use first token
+  const ids = lines.map((l) => l.split(",")[0].trim());
+  return ids;
 }

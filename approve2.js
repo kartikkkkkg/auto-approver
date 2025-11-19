@@ -1,5 +1,5 @@
 /**
- * approve.js — final version using your config.js selectors
+ * approve.js — full file (40s forced wait after filling search)
  *
  * Usage:
  *   node approve.js requests.csv
@@ -67,6 +67,7 @@ async function safeScreenshot(page, nameSuffix = "") {
     return null;
   }
 }
+
 async function saveText(name, text) {
   try {
     const p = path.join(ERR_DIR, name);
@@ -134,7 +135,6 @@ async function switchUser(page, who) {
     } catch (e) {}
   }
 
-  // try to click exact option
   const opt = cfg.sel.switchOption ? cfg.sel.switchOption(who) : `text="${who}"`;
   const optionSelectors = [
     opt,
@@ -158,7 +158,6 @@ async function switchUser(page, who) {
     } catch (e) {}
   }
 
-  // partial by first name
   const firstName = who.split(",")[0].trim();
   const partials = [`text=${firstName}`, `div[role="option"]:has-text("${firstName}")`];
   for (const sel of partials) {
@@ -203,7 +202,6 @@ async function waitForSearchControl(page, timeout = 20000) {
   ];
 
   while (Date.now() - start < timeout) {
-    // try plain inputs (including cfg.sel.searchInput)
     for (const sel of inputCandidates) {
       try {
         if (!sel) continue;
@@ -215,7 +213,6 @@ async function waitForSearchControl(page, timeout = 20000) {
       } catch (e) {}
     }
 
-    // react-like containers
     for (const sel of reactCandidates) {
       try {
         const loc = page.locator(sel).first();
@@ -240,11 +237,9 @@ async function fillSearchControl(page, control, text) {
     await page.fill(control.selector, text);
     await sleep(300);
   } else {
-    // react-select: click wrapper then type
     const loc = page.locator(control.selector).first();
     await loc.click({ force: true });
     await sleep(150);
-    // clear by select all/backspace
     await page.keyboard.down('Control');
     await page.keyboard.press('A');
     await page.keyboard.up('Control');
@@ -271,24 +266,38 @@ async function clearSearchGeneric(page, control) {
   }
 }
 
+/* -------------------------
+   SELECT BY SEARCH (with forced 40s wait)
+   -> replaced per your request to wait 40 seconds AFTER typing the ID
+-------------------------- */
 async function selectBySearch(page, control, id) {
+  // clear previous text then type the id into the control
   await clearSearchGeneric(page, control);
   await fillSearchControl(page, control, id);
 
+  // WAIT 40 seconds to allow the portal to perform its search and load results
+  console.log(`Typed "${id}" — waiting 40s for results to appear...`);
+  await sleep(40000);
+
+  // after the forced wait, poll for the result row for a short while
   for (let i = 0; i < 20; i++) {
     await sleep(250);
     const rowCount = await page.locator(cfg.sel.rowById(id)).count().catch(()=>0);
     if (rowCount > 0) {
       try {
+        // try to toggle the checkbox; if that fails, click the row then checkbox
         await page.check(cfg.sel.rowCheckbox(id)).catch(async () => {
           const row = page.locator(cfg.sel.rowById(id)).first();
           await row.click({ position: { x: 20, y: 12 } }).catch(()=>{});
           try { await page.check(cfg.sel.rowCheckbox(id)); } catch {}
         });
-      } catch (e) {}
+      } catch (e) {
+        // ignore and continue — we still consider the row found
+      }
       return true;
     }
   }
+  // no result after polling
   return false;
 }
 

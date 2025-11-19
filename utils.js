@@ -17,10 +17,9 @@ export function ensureDir(dirPath) {
  * Timestamp string usable in filenames
  */
 export function ts() {
-  // local-ish readable timestamp
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
 /**
@@ -30,7 +29,7 @@ export function ts() {
 export function readRequests(csvPath) {
   const txt = fs.readFileSync(csvPath, { encoding: "utf8" });
   const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  // if file has header that looks like "request_id" or "id", ignore first line
+  // if file has header that looks like non-numeric first line, ignore first line
   if (lines.length > 1 && /[A-Za-z]/.test(lines[0]) && !/^\d/.test(lines[0])) {
     lines.shift();
   }

@@ -28,3 +28,10 @@ export function safeText(s) {
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+export async function saveText(filename, text) {
+  try {
+    await fs.promises.writeFile(filename, text, "utf8");
+  } catch (e) {
+    console.warn("saveText failed:", e.message);
+  }
+}

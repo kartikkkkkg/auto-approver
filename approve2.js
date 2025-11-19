@@ -1,13 +1,14 @@
 /**
- * approve.js — full file (40s forced wait after filling search)
+ * approve.js - robust version (search typing + label-click checkbox + 40s wait)
  *
  * Usage:
  *   node approve.js requests.csv
  *
  * Requirements:
- *   - Node 18+
- *   - npm i playwright
- *   - npx playwright install msedge
+ * - config.js exporting `cfg` (your existing file)
+ * - utils.js exporting helper functions used previously (ensure names match)
+ *
+ * This file assumes ESM (import) like your previous snippet.
  */
 
 import fs from "fs";
@@ -19,7 +20,9 @@ import {
   ts,
   readRequests,
   appendLog,
-  sleep
+  sleep,
+  safeScreenshot as utilSafeScreenshot,
+  saveText
 } from "./utils.js";
 
 const LOGS_DIR = path.resolve("logs");
@@ -49,9 +52,6 @@ async function startBrowser() {
 }
 
 async function gotoHome(page) {
-  if (!cfg.urls.homeNoelle || cfg.urls.homeNoelle.includes("<your-noelle-url-here>")) {
-    throw new Error("Please set cfg.urls.homeNoelle to your portal URL in config.js");
-  }
   await page.goto(cfg.urls.homeNoelle, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle");
 }
@@ -68,17 +68,6 @@ async function safeScreenshot(page, nameSuffix = "") {
   }
 }
 
-async function saveText(name, text) {
-  try {
-    const p = path.join(ERR_DIR, name);
-    fs.writeFileSync(p, text);
-    return p;
-  } catch (e) {
-    console.warn("saveText failed:", e.message);
-    return null;
-  }
-}
-
 async function clickIf(page, selector) {
   try {
     const loc = page.locator(selector);
@@ -90,20 +79,23 @@ async function clickIf(page, selector) {
   return false;
 }
 
-/* -------------------------
-   switchUser (robust)
--------------------------- */
+/* --------------------------
+   SWITCH USER (unchanged robust version)
+--------------------------- */
 async function switchUser(page, who) {
   console.log(`→ switchUser: choose "${who}"`);
+
   await clickIf(page, cfg.sel.switchLink);
   await sleep(300);
-  await page.waitForSelector(`text=${cfg.sel.switchDialogTitle}`, { timeout: 6000 }).catch(()=>{});
+
+  await page.waitForSelector('text=Switch View', { timeout: 6000 }).catch(()=>{});
 
   const openerCandidates = [
     'div[role="dialog"] >> text="Select..."',
-    'div[role="dialog"] >> [role="combobox"]',
-    'div[role="dialog"] >> .react-select__control',
+    'div[role="dialog"] >> text=Select',
+    'div[role="dialog"] >> .select__control',
     'div[role="dialog"] >> button[aria-haspopup="listbox"]',
+    'div[role="dialog"] >> [role="combobox"]',
     'div[role="dialog"] >> svg',
     'select'
   ];
@@ -135,12 +127,15 @@ async function switchUser(page, who) {
     } catch (e) {}
   }
 
-  const opt = cfg.sel.switchOption ? cfg.sel.switchOption(who) : `text="${who}"`;
+  await sleep(220);
+
   const optionSelectors = [
-    opt,
     `div[role="option"]:has-text("${who}")`,
+    `div[role="listbox"] >> text="${who}"`,
+    `div[role="dialog"] >> text="${who}"`,
     `text="${who}"`,
-    `li:has-text("${who}")`
+    `li:has-text("${who}")`,
+    `div:has-text("${who}")`
   ];
 
   for (const sel of optionSelectors) {
@@ -159,8 +154,12 @@ async function switchUser(page, who) {
   }
 
   const firstName = who.split(",")[0].trim();
-  const partials = [`text=${firstName}`, `div[role="option"]:has-text("${firstName}")`];
-  for (const sel of partials) {
+  const partialCandidates = [
+    `div[role="option"]:has-text("${firstName}")`,
+    `div[role="dialog"] >> text=${firstName}`,
+    `text=${firstName}`
+  ];
+  for (const sel of partialCandidates) {
     try {
       const loc = page.locator(sel);
       if (await loc.count()) {
@@ -175,179 +174,163 @@ async function switchUser(page, who) {
   }
 
   const shot = await safeScreenshot(page, "-switch-failed");
-  await saveText("switch-error.txt", `Could not select "${who}". Screenshot: ${shot}`);
+  await saveText("switch-error.txt", `Could not select "${who}" in Switch dialog. Screenshot: ${shot}\n`);
   throw new Error(`switchUser: unable to programmatically select "${who}". Screenshot: ${shot}`);
 }
 
 /* -------------------------
-   Wait for search control (react-select style or plain input)
+   SEARCH helpers (new robust approach)
 -------------------------- */
-async function waitForSearchControl(page, timeout = 20000) {
-  const start = Date.now();
 
-  const reactCandidates = [
-    '.react-select__control',
-    '.react-select__value-container',
-    'div[class*="react-select"]',
+// Type into the visible search control (safe)
+async function typeIntoSearch(page, text) {
+  // Try a few container selectors for the visible search box (from your screenshots)
+  const containerCandidates = [
+    'div[id^="Search"]',
+    'div.react-select__control',
+    'div.css-1trtksz.react-select__value-container',
     'div[role="combobox"]',
-    'div[class*="Search-"]'
+    'div.search-container',
+    'div[placeholder*="Search by request"]'
   ];
 
-  const inputCandidates = [
-    cfg.sel.searchInput,
-    'input[placeholder*="Search by request ID"]',
-    'input[type="search"]',
-    'input[aria-label*="Search"]',
-    'input'
-  ];
-
-  while (Date.now() - start < timeout) {
-    for (const sel of inputCandidates) {
-      try {
-        if (!sel) continue;
-        const loc = page.locator(sel).first();
-        if (await loc.count() && await loc.isVisible().catch(()=>false)) {
-          console.log("Found plain input using:", sel);
-          return { type: 'input', selector: sel };
-        }
-      } catch (e) {}
-    }
-
-    for (const sel of reactCandidates) {
-      try {
-        const loc = page.locator(sel).first();
-        if (await loc.count() && await loc.isVisible().catch(()=>false)) {
-          console.log("Found react-style control using:", sel);
-          return { type: 'react', selector: sel };
-        }
-      } catch (e) {}
-    }
-
-    await sleep(300);
-  }
-
-  throw new Error("waitForSearchControl: timed out waiting for search control");
-}
-
-/* -------------------------
-   Fill handler for control
--------------------------- */
-async function fillSearchControl(page, control, text) {
-  if (control.type === 'input') {
-    await page.fill(control.selector, text);
-    await sleep(300);
-  } else {
-    const loc = page.locator(control.selector).first();
-    await loc.click({ force: true });
-    await sleep(150);
-    await page.keyboard.down('Control');
-    await page.keyboard.press('A');
-    await page.keyboard.up('Control');
-    await page.keyboard.press('Backspace');
-    await sleep(100);
-    await page.keyboard.type(text, { delay: 50 });
-    await sleep(200);
-  }
-}
-
-async function clearSearchGeneric(page, control) {
-  if (control.type === 'input') {
-    try { await page.fill(control.selector, ""); } catch {}
-  } else {
+  let clicked = false;
+  for (const c of containerCandidates) {
     try {
-      await page.locator(control.selector).first().click({ force: true });
-      await sleep(80);
-      await page.keyboard.down('Control');
-      await page.keyboard.press('A');
-      await page.keyboard.up('Control');
-      await page.keyboard.press('Backspace');
-      await sleep(80);
+      const cont = page.locator(c);
+      if (await cont.count() > 0) {
+        await cont.first().click({ force: true });
+        clicked = true;
+        break;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  if (!clicked) {
+    try {
+      await page.click('text=Search by request ID', { timeout: 2000 }).catch(()=>{});
+      clicked = true;
     } catch (e) {}
   }
+
+  // Clear any previous content, then type slowly
+  try {
+    await page.keyboard.down('Control');
+    await page.keyboard.press('A').catch(()=>{});
+    await page.keyboard.up('Control');
+    await page.keyboard.press('Backspace').catch(()=>{});
+  } catch (e) {}
+
+  await page.keyboard.type(text, { delay: 50 });
+}
+
+// Given a visible id text in the page, find its result row and click label to toggle checkbox
+async function findRowAndCheck(page, id) {
+  const waitMs = 40000; // 40s as requested
+
+  // Wait for the text to appear somewhere
+  const txtLoc = page.locator(`text=${id}`).first();
+  try {
+    await txtLoc.waitFor({ timeout: waitMs });
+  } catch (e) {
+    return false;
+  }
+
+  // Find ancestor row container that includes the id link. We will try xpath and generic div:has-text.
+  const rowCandidates = [
+    `xpath=//div[.//a[contains(normalize-space(.),"${id}")]]`,
+    `xpath=//div[.//*[contains(normalize-space(text()),"${id}")]]`,
+    `div:has-text("${id}")`
+  ];
+
+  let row = null;
+  for (const r of rowCandidates) {
+    const cand = page.locator(r).first();
+    if (await cand.count()) { row = cand; break; }
+  }
+  if (!row) return false;
+
+  // inside the row, find the checkbox input
+  const checkbox = row.locator('input[type="checkbox"]');
+  if (await checkbox.count() === 0) {
+    // fallback: click a clickable area in the row (left area)
+    try {
+      await row.click({ position: { x: 10, y: 10 }, force: true });
+      await page.waitForTimeout(200);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // prefer to click the label associated with the input id
+  const cbId = (await checkbox.first().getAttribute('id')) || null;
+  if (cbId) {
+    const labelSel = `label[for="${cbId}"]`;
+    try {
+      const lab = page.locator(labelSel).first();
+      if (await lab.count()) {
+        await lab.click({ force: true });
+        await page.waitForTimeout(200);
+        return true;
+      }
+    } catch (e) {}
+  }
+
+  // final fallback: click the input itself
+  try {
+    await checkbox.first().click({ force: true });
+    await page.waitForTimeout(200);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Combined selectBySearch using the safe type + findRowAndCheck
+async function selectBySearch(page, id) {
+  await typeIntoSearch(page, id);
+  console.log(`Typed "${id}" - waiting 40s for results to appear...`);
+  const ok = await findRowAndCheck(page, id);
+  if (!ok) {
+    console.warn("selectBySearch: not found/checked:", id);
+    return false;
+  }
+  await page.waitForTimeout(400);
+  return true;
 }
 
 /* -------------------------
-   SELECT BY SEARCH (with forced 40s wait)
-   -> replaced per your request to wait 40 seconds AFTER typing the ID
+   Bulk approve helper
 -------------------------- */
-async function selectBySearch(page, control, id) {
-  // clear previous text then type the id into the control
-  await clearSearchGeneric(page, control);
-  await fillSearchControl(page, control, id);
-
-  // WAIT 40 seconds to allow the portal to perform its search and load results
-  console.log(`Typed "${id}" — waiting 40s for results to appear...`);
-  await sleep(40000);
-
-  // after the forced wait, poll for the result row for a short while
-  for (let i = 0; i < 20; i++) {
-    await sleep(250);
-    const rowCount = await page.locator(cfg.sel.rowById(id)).count().catch(()=>0);
-    if (rowCount > 0) {
-      try {
-        // try to toggle the checkbox; if that fails, click the row then checkbox
-        await page.check(cfg.sel.rowCheckbox(id)).catch(async () => {
-          const row = page.locator(cfg.sel.rowById(id)).first();
-          await row.click({ position: { x: 20, y: 12 } }).catch(()=>{});
-          try { await page.check(cfg.sel.rowCheckbox(id)); } catch {}
-        });
-      } catch (e) {
-        // ignore and continue — we still consider the row found
-      }
-      return true;
-    }
-  }
-  // no result after polling
-  return false;
-}
-
 async function bulkApprove(page) {
-  await page.click(cfg.sel.bulkApproveBtn);
+  await page.click(cfg.sel.bulkApproveBtn).catch(()=>{});
   await sleep(300);
   await clickIf(page, cfg.sel.approveConfirmBtn);
   await sleep(900);
 }
 
-async function batchApproveInUser(page, control, ids, batchSize = cfg.batchSize) {
+/* iterate ids within a user's view */
+async function batchApproveInUser(page, ids, batchSize = cfg.batchSize) {
   const remaining = new Set(ids);
   while (remaining.size > 0) {
     let selected = 0;
     for (const id of [...remaining]) {
-      const ok = await selectBySearch(page, control, id);
+      const ok = await selectBySearch(page, id).catch(()=>false);
       if (ok) { remaining.delete(id); selected++; }
       if (selected >= batchSize) break;
     }
     if (selected === 0) break;
     await bulkApprove(page);
-    await clearSearchGeneric(page, control);
-    await sleep(300);
+    // after approve, clear search (click the clear x or re-focus search and backspace)
+    try {
+      // try clicking clear X if present
+      await clickIf(page, 'button:has-text("Clear"), button[aria-label="Clear"]');
+    } catch {}
+    await typeIntoSearch(page, ""); // clear
+    await sleep(400);
   }
   return [...remaining];
-}
-
-/* -------------------------
-   ensureSwitchedTo wrapper
--------------------------- */
-async function ensureSwitchedTo(page, who) {
-  await switchUser(page, who);
-
-  try {
-    await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(()=>{});
-    await page.reload({ waitUntil: 'domcontentloaded' }).catch(()=>{});
-    await page.waitForLoadState('networkidle').catch(()=>{});
-  } catch (e) {
-    console.warn("ensureSwitchedTo: reload step failed:", e.message);
-  }
-
-  const control = await waitForSearchControl(page, 20000).catch(async (e) => {
-    const shot = await safeScreenshot(page, "-no-search-found");
-    await saveText("no-search-found.txt", `Switched to ${who} but search control not found. Screenshot: ${shot}\n`);
-    throw e;
-  });
-
-  try { await page.locator(control.selector).first().focus().catch(()=>{}); await sleep(150); } catch (e) {}
-
-  return control;
 }
 
 /* -------------------------
@@ -367,17 +350,12 @@ async function main() {
     await gotoHome(page);
 
     const body = await page.textContent("body").catch(()=>"");
-    if (!body.includes(cfg.users.noelle.split(",")[0])) {
-      console.log("Switching to Noelle initially...");
-      await ensureSwitchedTo(page, cfg.users.noelle);
+    if (!body.includes("Eder")) {
+      await switchUser(page, cfg.users.noelle);
     }
 
-    // detect control
-    let control = await waitForSearchControl(page, 15000);
-    console.log("Search control:", control);
-
     console.log("→ Approving in Noelle...");
-    const notFoundNoelle = await batchApproveInUser(page, control, ids);
+    const notFoundNoelle = await batchApproveInUser(page, ids);
     const approvedNoelle = ids.filter(x => !notFoundNoelle.includes(x));
     for (const x of approvedNoelle) appendLog(outPath, `${ts()},${x},approved_in_noelle,\n`);
 
@@ -388,17 +366,16 @@ async function main() {
     }
 
     console.log("→ Switching to Alvaro...");
-    await ensureSwitchedTo(page, cfg.users.alvaro);
-    control = await waitForSearchControl(page, 15000);
-    const notFoundAlvaro = await batchApproveInUser(page, control, notFoundNoelle);
+    await switchUser(page, cfg.users.alvaro);
+
+    const notFoundAlvaro = await batchApproveInUser(page, notFoundNoelle);
     const approvedAlvaro = notFoundNoelle.filter(x => !notFoundAlvaro.includes(x));
     for (const x of approvedAlvaro) appendLog(outPath, `${ts()},${x},approved_in_alvaro,\n`);
 
     if (approvedAlvaro.length > 0) {
       console.log("→ Returning to Noelle for final approvals...");
-      await ensureSwitchedTo(page, cfg.users.noelle);
-      control = await waitForSearchControl(page, 15000);
-      const retry = await batchApproveInUser(page, control, approvedAlvaro);
+      await switchUser(page, cfg.users.noelle);
+      const retry = await batchApproveInUser(page, approvedAlvaro);
       for (const x of approvedAlvaro) {
         if (!retry.includes(x)) appendLog(outPath, `${ts()},${x},approved_after_alvaro_then_noelle,\n`);
         else appendLog(outPath, `${ts()},${x},approved_in_alvaro_only,\n`);

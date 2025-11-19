@@ -1,14 +1,15 @@
 /**
- * approve.js - robust version (search typing + label-click checkbox + 40s wait)
+ * approve.js - auto-approver with robust label-click checkbox handling
  *
  * Usage:
  *   node approve.js requests.csv
  *
- * Requirements:
- * - config.js exporting `cfg` (your existing file)
- * - utils.js exporting helper functions used previously (ensure names match)
- *
- * This file assumes ESM (import) like your previous snippet.
+ * Behavior:
+ *  - launches Edge with your profile
+ *  - goes to configured URL
+ *  - ensures view switches to Noelle (Eder, Noelle)
+ *  - searches & batch-approves requests
+ *  - on failures saves screenshots to logs/errors/
  */
 
 import fs from "fs";
@@ -21,7 +22,6 @@ import {
   readRequests,
   appendLog,
   sleep,
-  safeScreenshot as utilSafeScreenshot,
   saveText
 } from "./utils.js";
 
@@ -80,16 +80,19 @@ async function clickIf(page, selector) {
 }
 
 /* --------------------------
-   SWITCH USER (unchanged robust version)
+   Robust switchUser for custom dropdown
 --------------------------- */
 async function switchUser(page, who) {
   console.log(`→ switchUser: choose "${who}"`);
 
+  // open the Switch dialog
   await clickIf(page, cfg.sel.switchLink);
   await sleep(300);
 
+  // wait for dialog to appear (text from screenshots)
   await page.waitForSelector('text=Switch View', { timeout: 6000 }).catch(()=>{});
 
+  // Strategy: click the visible "Select..." area or the caret icon
   const openerCandidates = [
     'div[role="dialog"] >> text="Select..."',
     'div[role="dialog"] >> text=Select',
@@ -153,6 +156,7 @@ async function switchUser(page, who) {
     } catch (e) {}
   }
 
+  // Try partial match
   const firstName = who.split(",")[0].trim();
   const partialCandidates = [
     `div[role="option"]:has-text("${firstName}")`,
@@ -179,156 +183,132 @@ async function switchUser(page, who) {
 }
 
 /* -------------------------
-   SEARCH helpers (new robust approach)
+   search & select helpers
 -------------------------- */
-
-// Type into the visible search control (safe)
-async function typeIntoSearch(page, text) {
-  // Try a few container selectors for the visible search box (from your screenshots)
-  const containerCandidates = [
-    'div[id^="Search"]',
-    'div.react-select__control',
-    'div.css-1trtksz.react-select__value-container',
-    'div[role="combobox"]',
-    'div.search-container',
-    'div[placeholder*="Search by request"]'
-  ];
-
-  let clicked = false;
-  for (const c of containerCandidates) {
-    try {
-      const cont = page.locator(c);
-      if (await cont.count() > 0) {
-        await cont.first().click({ force: true });
-        clicked = true;
-        break;
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  if (!clicked) {
-    try {
-      await page.click('text=Search by request ID', { timeout: 2000 }).catch(()=>{});
-      clicked = true;
-    } catch (e) {}
-  }
-
-  // Clear any previous content, then type slowly
+async function clearSearch(page) {
   try {
-    await page.keyboard.down('Control');
-    await page.keyboard.press('A').catch(()=>{});
-    await page.keyboard.up('Control');
-    await page.keyboard.press('Backspace').catch(()=>{});
-  } catch (e) {}
-
-  await page.keyboard.type(text, { delay: 50 });
+    await page.click(cfg.sel.searchInput);
+    await page.keyboard.down("Control");
+    await page.keyboard.press("A");
+    await page.keyboard.up("Control");
+    await page.keyboard.press("Backspace");
+  } catch (e) {
+    try { await page.fill(cfg.sel.searchInput, ""); } catch {}
+  }
 }
 
-// Given a visible id text in the page, find its result row and click label to toggle checkbox
-async function findRowAndCheck(page, id) {
-  const waitMs = 40000; // 40s as requested
+/**
+ * selectBySearch: type id, wait up to waitMs (default 40s) for row,
+ * then click label or checkbox (works when input is hidden and label is clickable).
+ */
+async function selectBySearch(page, id, waitMs = 40000) {
+  await clearSearch(page);
 
-  // Wait for the text to appear somewhere
-  const txtLoc = page.locator(`text=${id}`).first();
-  try {
-    await txtLoc.waitFor({ timeout: waitMs });
-  } catch (e) {
-    return false;
-  }
+  // fill and allow React to process
+  await page.fill(cfg.sel.searchInput, id);
+  await page.waitForTimeout(250);
+  try { await page.click(cfg.sel.searchBtn); } catch (e) {}
 
-  // Find ancestor row container that includes the id link. We will try xpath and generic div:has-text.
-  const rowCandidates = [
-    `xpath=//div[.//a[contains(normalize-space(.),"${id}")]]`,
-    `xpath=//div[.//*[contains(normalize-space(text()),"${id}")]]`,
-    `div:has-text("${id}")`
-  ];
+  console.log(`Typed "${id}" - waiting ${Math.round(waitMs/1000)}s for results to appear...`);
+  const start = Date.now();
 
-  let row = null;
-  for (const r of rowCandidates) {
-    const cand = page.locator(r).first();
-    if (await cand.count()) { row = cand; break; }
-  }
-  if (!row) return false;
+  while (Date.now() - start < waitMs) {
+    await sleep(700);
 
-  // inside the row, find the checkbox input
-  const checkbox = row.locator('input[type="checkbox"]');
-  if (await checkbox.count() === 0) {
-    // fallback: click a clickable area in the row (left area)
-    try {
-      await row.click({ position: { x: 10, y: 10 }, force: true });
-      await page.waitForTimeout(200);
-      return true;
-    } catch (e) {
-      return false;
+    const rows = page.locator(cfg.sel.rowById(id));
+    const count = await rows.count().catch(()=>0);
+    if (count > 0) {
+      const row = rows.first();
+
+      // 1) Click visible label inside row (most robust for styled checkboxes)
+      const label = row.locator("label.custom-control-label");
+      if (await label.count()) {
+        try {
+          await label.first().click({ force: true });
+          await sleep(350);
+          return true;
+        } catch (e) {
+          console.warn("label click failed, fallback:", e.message);
+        }
+      }
+
+      // 2) Try evaluating a click on the hidden input in-page
+      const checkbox = row.locator('input[type="checkbox"]');
+      if (await checkbox.count()) {
+        try {
+          await checkbox.first().evaluate(el => el.click());
+          await sleep(350);
+          return true;
+        } catch (e) {
+          console.warn("checkbox.evaluate click failed:", e.message);
+        }
+      }
+
+      // 3) Click coordinates inside row (approx left)
+      try {
+        const box = await row.boundingBox();
+        if (box) {
+          await page.mouse.click(box.x + 18, box.y + box.height / 2, { force: true });
+          await sleep(350);
+          return true;
+        }
+      } catch (e) { /* ignore */ }
+
+      // continue waiting/polling if none worked
     }
   }
 
-  // prefer to click the label associated with the input id
-  const cbId = (await checkbox.first().getAttribute('id')) || null;
-  if (cbId) {
-    const labelSel = `label[for="${cbId}"]`;
+  return false;
+}
+
+async function bulkApprove(page) {
+  // Try several candidate selectors for the Approve button (footer/visible)
+  const approveBtnCandidates = [
+    'footer button:has-text("Approve")',
+    'button:has-text("Approve")',
+    'div[class*="pagination-bottom"] button:has-text("Approve")',
+    'button[aria-label="Approve"]'
+  ];
+
+  for (const sel of approveBtnCandidates) {
     try {
-      const lab = page.locator(labelSel).first();
-      if (await lab.count()) {
-        await lab.click({ force: true });
-        await page.waitForTimeout(200);
+      const loc = page.locator(sel);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        await sleep(300);
+        // Wait for confirm button to appear
+        await page.waitForSelector('button:has-text("Confirm")', { timeout: 4000 }).catch(()=>{});
         return true;
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn("bulkApprove candidate failed:", sel, e.message);
+    }
   }
 
-  // final fallback: click the input itself
-  try {
-    await checkbox.first().click({ force: true });
-    await page.waitForTimeout(200);
-    return true;
-  } catch (e) {
-    return false;
-  }
+  throw new Error("bulkApprove: could not find Approve button");
 }
 
-// Combined selectBySearch using the safe type + findRowAndCheck
-async function selectBySearch(page, id) {
-  await typeIntoSearch(page, id);
-  console.log(`Typed "${id}" - waiting 40s for results to appear...`);
-  const ok = await findRowAndCheck(page, id);
-  if (!ok) {
-    console.warn("selectBySearch: not found/checked:", id);
-    return false;
-  }
-  await page.waitForTimeout(400);
-  return true;
-}
-
-/* -------------------------
-   Bulk approve helper
--------------------------- */
-async function bulkApprove(page) {
-  await page.click(cfg.sel.bulkApproveBtn).catch(()=>{});
-  await sleep(300);
-  await clickIf(page, cfg.sel.approveConfirmBtn);
-  await sleep(900);
-}
-
-/* iterate ids within a user's view */
 async function batchApproveInUser(page, ids, batchSize = cfg.batchSize) {
   const remaining = new Set(ids);
   while (remaining.size > 0) {
     let selected = 0;
     for (const id of [...remaining]) {
-      const ok = await selectBySearch(page, id).catch(()=>false);
-      if (ok) { remaining.delete(id); selected++; }
+      const ok = await selectBySearch(page, id);
+      if (ok) {
+        remaining.delete(id);
+        selected++;
+      } else {
+        console.log(" → not found:", id);
+      }
       if (selected >= batchSize) break;
     }
     if (selected === 0) break;
+    // Approve whatever's selected
     await bulkApprove(page);
-    // after approve, clear search (click the clear x or re-focus search and backspace)
-    try {
-      // try clicking clear X if present
-      await clickIf(page, 'button:has-text("Clear"), button[aria-label="Clear"]');
-    } catch {}
-    await typeIntoSearch(page, ""); // clear
-    await sleep(400);
+    // Click confirm (modal)
+    await clickIf(page, 'button:has-text("Confirm")').catch(()=>{});
+    await sleep(900);
+    await clearSearch(page);
   }
   return [...remaining];
 }
@@ -349,6 +329,7 @@ async function main() {
   try {
     await gotoHome(page);
 
+    // Check active user snapshot (simple text search)
     const body = await page.textContent("body").catch(()=>"");
     if (!body.includes("Eder")) {
       await switchUser(page, cfg.users.noelle);

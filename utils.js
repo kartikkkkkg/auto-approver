@@ -1,82 +1,67 @@
+// utils.js
 import fs from "fs";
 import path from "path";
 
 /**
- * Ensures that a directory exists (creates if missing)
+ * Ensure directory exists (creates recursively)
  */
-export function ensureDir(dir) {
+export function ensureDir(dirPath) {
   try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
   } catch (e) {
     console.warn("ensureDir failed:", e.message);
   }
 }
 
 /**
- * Timestamp helper
+ * Timestamp string usable in filenames
  */
 export function ts() {
-  return new Date().toISOString().replace("T", " ").replace("Z", "");
+  // local-ish readable timestamp
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
 /**
- * Reads a CSV containing request IDs (one per line)
+ * Read CSV of requests (simple one-column list or header+one column).
+ * Returns array of trimmed IDs (skips blank lines).
  */
 export function readRequests(csvPath) {
-  try {
-    const raw = fs.readFileSync(csvPath, "utf8");
-    return raw
-      .split(/\r?\n/)
-      .map((x) => x.trim())
-      .filter((x) => x.length > 0);
-  } catch (e) {
-    console.error("readRequests failed:", e.message);
-    return [];
+  const txt = fs.readFileSync(csvPath, { encoding: "utf8" });
+  const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  // if file has header that looks like "request_id" or "id", ignore first line
+  if (lines.length > 1 && /[A-Za-z]/.test(lines[0]) && !/^\d/.test(lines[0])) {
+    lines.shift();
   }
+  return lines;
 }
 
 /**
- * Appends a line to a log file
+ * Append a single CSV line to a log file
  */
-export function appendLog(filePath, line) {
-  try {
-    fs.appendFileSync(filePath, line, "utf8");
-  } catch (e) {
-    console.warn("appendLog failed:", e.message);
-  }
+export function appendLog(filePath, text) {
+  fs.appendFileSync(filePath, text, { encoding: "utf8" });
 }
 
 /**
- * Sleep helper
+ * Sleep helper (ms)
  */
 export function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
- * Captures a screenshot safely
+ * Save a text file to the errors/logs directory (useful for dumps)
  */
-export async function safeScreenshot(page, nameSuffix = "") {
+export function saveText(name, text, dir = "logs/errors") {
   try {
-    const filename = path.join("logs", "errors", `${Date.now()}${nameSuffix}.png`);
-    await page.screenshot({ path: filename, fullPage: true });
-    console.log("Saved screenshot:", filename);
-    return filename;
-  } catch (e) {
-    console.warn("safeScreenshot failed:", e.message);
-    return null;
-  }
-}
-
-/**
- * Writes text to a file safely
- */
-export async function saveText(filename, text) {
-  try {
-    await fs.promises.writeFile(path.join("logs", "errors", filename), text, "utf8");
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, text, "utf8");
+    return p;
   } catch (e) {
     console.warn("saveText failed:", e.message);
+    return null;
   }
 }

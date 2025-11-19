@@ -1,15 +1,4 @@
-/**
- * approve.js
- * Usage: node approve.js requests.csv
- *
- * Robust version that:
- * - switches user (Noelle/Alvaro)
- * - finds the correct search input (avoids filling checkboxes)
- * - waits up to 40s for results
- * - selects the result's checkbox by clicking the visible label
- * - bulk approves and confirms
- */
-
+// approve.js
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
@@ -27,6 +16,9 @@ const LOGS_DIR = path.resolve("logs");
 const ERR_DIR = path.join(LOGS_DIR, "errors");
 ensureDir(LOGS_DIR);
 ensureDir(ERR_DIR);
+
+// how long to wait after clicking the per-row approve button (ms)
+const WAIT_AFTER_APPROVE_MS = cfg.waitAfterApproveMs || 15000; // default 15s
 
 function userDataDir() {
   return `C:\\Users\\${cfg.edgeProfileUser}\\AppData\\Local\\Microsoft\\Edge\\User Data`;
@@ -78,7 +70,7 @@ async function clickIf(page, selector) {
 }
 
 /* --------------------------
-   Robust switchUser: same as before
+   switchUser (keeps your robust detection code)
 --------------------------- */
 async function switchUser(page, who) {
   console.log(`→ switchUser: choose "${who}"`);
@@ -152,11 +144,9 @@ async function switchUser(page, who) {
 }
 
 /* -------------------------
-   Find the correct search input (defensive)
-   Returns locator string we can use (a Playwright locator)
+   Defensive search input finder
 -------------------------- */
-async function findSearchInput(page, timeout = 15000) {
-  // try placeholder match
+async function findSearchInput(page, timeout = 10000) {
   const placeholderCandidates = [
     'input[placeholder*="Search by request ID"]',
     'input[placeholder*="Search by request"]',
@@ -169,7 +159,6 @@ async function findSearchInput(page, timeout = 15000) {
       try {
         const loc = page.locator(sel);
         if (await loc.count()) {
-          // pick the visible and enabled one
           const count = await loc.count();
           for (let i = 0; i < count; i++) {
             const l = loc.nth(i);
@@ -181,7 +170,6 @@ async function findSearchInput(page, timeout = 15000) {
       } catch (e){}
     }
 
-    // fallback: look for a react-select container that contains an input
     try {
       const container = page.locator('div[id^="Search-"], div.react-select, div.search-container').first();
       if (await container.count()) {
@@ -199,38 +187,32 @@ async function findSearchInput(page, timeout = 15000) {
 }
 
 /* -------------------------
-   Clear + fill search input safely
+   Fill search
 -------------------------- */
-async function fillSearch(page, inputLocator, id) {
-  // inputLocator is a Playwright locator object
+async function fillSearch(page, inputLoc, id) {
   try {
-    await inputLocator.scrollIntoViewIfNeeded();
-    await inputLocator.click({ clickCount: 3, force: true }).catch(()=>{});
-    await inputLocator.fill(""); // clear
+    await inputLoc.scrollIntoViewIfNeeded();
+    await inputLoc.click({ clickCount: 3, force: true }).catch(()=>{});
+    await inputLoc.fill("");
     await sleep(120);
-    await inputLocator.fill(id);
+    await inputLoc.fill(id);
     await sleep(250);
-    // try to press Enter or click search icon if present
-    try {
-      await inputLocator.press('Enter');
-    } catch {}
-    await clickIf(page, cfg.sel.searchBtn);
+    try { await inputLoc.press('Enter'); } catch {}
+    await clickIf(page, cfg.sel.searchBtn); // optional
   } catch (e) {
     throw new Error("fillSearch failed: " + e.message);
   }
 }
 
 /* -------------------------
-   Wait up to 40s for a row result to appear
-   row locator pattern is provided by cfg.sel.rowById(id)
+   Wait for a row to appear
 -------------------------- */
-async function waitForResultRow(page, id, maxMs = 40000) {
+async function waitForResultRow(page, id, maxMs = 30000) {
   const sel = cfg.sel.rowById(id);
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const count = await page.locator(sel).count().catch(()=>0);
     if (count > 0) {
-      // ensure visible one exists
       for (let i = 0; i < count; i++) {
         const l = page.locator(sel).nth(i);
         if (await l.isVisible().catch(()=>false)) {
@@ -244,38 +226,37 @@ async function waitForResultRow(page, id, maxMs = 40000) {
 }
 
 /* -------------------------
-   Select checkbox for a row locator
-   Tries label click, input.click(), row.click offsets.
+   Click the per-row approve button (blue) — no modal confirm
+   The button sits inside the row; try a few selectors.
 -------------------------- */
-async function selectRowCheckbox(page, rowLocator, id) {
-  // try to find visible label inside the row
-  try {
-    const label = rowLocator.locator('.custom-control-label').first();
-    if (await label.count() && await label.isVisible().catch(()=>false)) {
-      await label.scrollIntoViewIfNeeded();
-      await label.click({ force: true });
-      await sleep(240);
-      // confirm checkbox is selected via bottom "x selected" indicator
-      return true;
-    }
-  } catch (e){}
+async function clickRowApproveButton(page, rowLocator) {
+  // Try several ways to find the approve button in the row
+  const candidateSelectors = [
+    'button[title="Approve"]',
+    'span[title="Approve"] button',
+    'button:has-text("✓")',
+    'button:has-text("Approve")',
+    'button.btn.btn-secondary',
+    'button'
+  ];
 
-  // try to click the input[type=checkbox] via page.evaluate to call click()
-  try {
-    const input = await rowLocator.locator('input[type="checkbox"]').first();
-    if (await input.count()) {
-      await page.evaluate((el) => el.click(), await input.elementHandle());
-      await sleep(200);
-      return true;
-    }
-  } catch (e) {}
+  for (const sel of candidateSelectors) {
+    try {
+      const btn = rowLocator.locator(sel).first();
+      if (await btn.count() && await btn.isVisible().catch(()=>false)) {
+        await btn.scrollIntoViewIfNeeded();
+        await btn.click({ force: true });
+        return true;
+      }
+    } catch (e) {}
+  }
 
-  // fallback: click near the left side of the row
+  // fallback: try to click at a likely coordinates area inside the row (right side)
   try {
     const box = await rowLocator.boundingBox();
     if (box) {
-      await page.mouse.click(box.x + 12, box.y + box.height / 2, { force: true });
-      await sleep(200);
+      // click near right-center of the row
+      await page.mouse.click(box.x + box.width - 30, box.y + box.height / 2, { force: true });
       return true;
     }
   } catch (e) {}
@@ -284,71 +265,68 @@ async function selectRowCheckbox(page, rowLocator, id) {
 }
 
 /* -------------------------
-   selectBySearch: search + wait + select checkbox
+   Single-request flow: search -> click approve button -> wait -> clear search
 -------------------------- */
-async function selectBySearch(page, id) {
-  // find the specific search input locator each time (defensive)
+async function processSingleRequest(page, id) {
   const inputLoc = await findSearchInput(page, 8000).catch(()=>null);
-  if (!inputLoc) throw new Error("selectBySearch: search input not found");
+  if (!inputLoc) {
+    throw new Error("Search input not found");
+  }
 
   await fillSearch(page, inputLoc, id);
 
-  // wait for result row
-  const row = await waitForResultRow(page, id, 40000);
-  if (!row) return false;
-
-  // attempt to select its checkbox
-  const ok = await selectRowCheckbox(page, row, id);
-  if (!ok) {
-    // capture screenshot and return false so we can inspect
-    await safeScreenshot(page, `-checkbox-failed-${id}`);
-    return false;
+  const row = await waitForResultRow(page, id, 30000);
+  if (!row) {
+    return { found: false };
   }
-  return true;
+
+  const clicked = await clickRowApproveButton(page, row);
+  if (!clicked) {
+    const shot = await safeScreenshot(page, `-approveclick-failed-${id}`);
+    await saveText(`approve-fail-${id}.txt`, `Could not click approve button for ${id}. Screenshot: ${shot}\n`);
+    return { found: true, clicked: false };
+  }
+
+  // wait the configured settle time (15-20s) for the action to process
+  await sleep(WAIT_AFTER_APPROVE_MS);
+
+  // best-effort: clear the search input
+  try {
+    await inputLoc.fill("");
+  } catch (e) {}
+
+  return { found: true, clicked: true };
 }
 
 /* -------------------------
-   batch approve helpers
+   Process lists for a specific user (Noelle/Alvaro)
+   returns remaining IDs (not found in this user)
 -------------------------- */
-async function bulkApprove(page) {
-  // scroll bottom into view to click approve
-  try {
-    await page.locator(cfg.sel.bulkApproveBtn).first().scrollIntoViewIfNeeded();
-    await clickIf(page, cfg.sel.bulkApproveBtn);
-    await sleep(400);
-  } catch (e) {}
-  await clickIf(page, cfg.sel.approveConfirmBtn); // when modal appears
-  await sleep(900);
-}
-
-async function batchApproveInUser(page, ids, batchSize = cfg.batchSize) {
-  const remaining = new Set(ids);
-  while (remaining.size > 0) {
-    let selected = 0;
-    for (const id of [...remaining]) {
-      try {
-        const ok = await selectBySearch(page, id).catch((e) => {
-          console.warn("selectBySearch failed for", id, e.message);
-          return false;
-        });
-        if (ok) { remaining.delete(id); selected++; }
-        if (selected >= batchSize) break;
-      } catch (e) {
-        console.warn("Error selecting id", id, e.message);
-      }
-    }
-    if (selected === 0) break;
-    await bulkApprove(page);
-    // clear search input
+async function processIdsInUser(page, ids) {
+  const remaining = [];
+  for (const id of ids) {
     try {
-      const inputLoc = await findSearchInput(page, 4000).catch(()=>null);
-      if (inputLoc) {
-        await inputLoc.fill("");
+      console.log("Searching:", id);
+      const res = await processSingleRequest(page, id);
+      if (!res.found) {
+        console.log("Not found for this user:", id);
+        remaining.push(id);
+      } else if (res.clicked) {
+        console.log("Approved (row button):", id);
+      } else {
+        console.warn("Found but approve click failed:", id);
+        remaining.push(id);
       }
-    } catch (e) {}
-    await sleep(400);
+    } catch (e) {
+      console.error("Error processing", id, e.message);
+      const shot = await safeScreenshot(page, `-process-err-${id}`);
+      await saveText(`process-err-${id}.txt`, `${e.stack}\nScreenshot: ${shot}\n`);
+      remaining.push(id);
+    }
+    // small pause between items so UI has time to stabilize
+    await sleep(500);
   }
-  return [...remaining];
+  return remaining;
 }
 
 /* -------------------------
@@ -358,6 +336,8 @@ async function main() {
   const input = process.argv[2] || "requests.csv";
   if (!fs.existsSync(input)) { console.error("requests.csv missing"); return; }
   const ids = readRequests(input);
+  if (!ids.length) { console.log("No IDs found"); return; }
+
   const outPath = path.join(LOGS_DIR, `run-${ts().replace(/[: ]/g,"")}.csv`);
   appendLog(outPath, "time,request_id,result,notes\n");
 
@@ -368,16 +348,17 @@ async function main() {
     await gotoHome(page);
 
     const body = await page.textContent("body").catch(()=>"");
-    if (!body.includes("Eder")) {
+    // ensure Noelle is active; if not, switch
+    if (!body.includes(cfg.users.noelle.split(",")[1].trim()) && !body.includes(cfg.users.noelle.split(",")[0].trim())) {
       await switchUser(page, cfg.users.noelle);
     }
 
-    console.log("→ Approving in Noelle...");
-    const notFoundNoelle = await batchApproveInUser(page, ids);
-    const approvedNoelle = ids.filter(x => !notFoundNoelle.includes(x));
-    for (const x of approvedNoelle) appendLog(outPath, `${ts()},${x},approved_in_noelle,\n`);
+    console.log("→ Processing in Noelle...");
+    const notInNoelle = await processIdsInUser(page, ids);
+    const approvedNoelle = ids.filter(x => !notInNoelle.includes(x));
+    for (const x of approvedNoelle) appendLog(outPath, `${ts()},${x},approved_in_noelle,per-row\n`);
 
-    if (notFoundNoelle.length === 0) {
+    if (notInNoelle.length === 0) {
       console.log("Done. Log:", outPath);
       await context.close();
       return;
@@ -386,21 +367,12 @@ async function main() {
     console.log("→ Switching to Alvaro...");
     await switchUser(page, cfg.users.alvaro);
 
-    const notFoundAlvaro = await batchApproveInUser(page, notFoundNoelle);
-    const approvedAlvaro = notFoundNoelle.filter(x => !notFoundAlvaro.includes(x));
-    for (const x of approvedAlvaro) appendLog(outPath, `${ts()},${x},approved_in_alvaro,\n`);
+    const notInAlvaro = await processIdsInUser(page, notInNoelle);
+    const approvedAlvaro = notInNoelle.filter(x => !notInAlvaro.includes(x));
+    for (const x of approvedAlvaro) appendLog(outPath, `${ts()},${x},approved_in_alvaro,per-row\n`);
 
-    if (approvedAlvaro.length > 0) {
-      console.log("→ Returning to Noelle for final approvals...");
-      await switchUser(page, cfg.users.noelle);
-      const retry = await batchApproveInUser(page, approvedAlvaro);
-      for (const x of approvedAlvaro) {
-        if (!retry.includes(x)) appendLog(outPath, `${ts()},${x},approved_after_alvaro_then_noelle,\n`);
-        else appendLog(outPath, `${ts()},${x},approved_in_alvaro_only,\n`);
-      }
-    }
-
-    for (const x of notFoundAlvaro) appendLog(outPath, `${ts()},${x},not_found_anywhere,\n`);
+    // anything still remaining is not found anywhere
+    for (const x of notInAlvaro) appendLog(outPath, `${ts()},${x},not_found_anywhere,\n`);
 
     console.log("✔ DONE → Log:", outPath);
     await context.close();

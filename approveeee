@@ -1,0 +1,457 @@
+// approve.js
+import fs from "fs";
+import path from "path";
+import { chromium } from "playwright";
+import { cfg } from "./config.js"; // your config file
+import {
+  ensureDir,
+  ts,
+  readRequests,
+  appendLog,
+  sleep,
+  saveText
+} from "./utils.js";
+
+const LOGS_DIR = path.resolve("logs");
+const ERR_DIR = path.join(LOGS_DIR, "errors");
+ensureDir(LOGS_DIR);
+ensureDir(ERR_DIR);
+
+function userDataDir() {
+  return `C:\\Users\\${cfg.edgeProfileUser}\\AppData\\Local\\Microsoft\\Edge\\User Data`;
+}
+
+async function startBrowser() {
+  const profile = userDataDir();
+  try {
+    if (fs.existsSync(profile)) {
+      return await chromium.launchPersistentContext(profile, {
+        headless: false,
+        channel: "msedge",
+        viewport: { width: 1400, height: 900 }
+      });
+    }
+  } catch (e) {
+    console.warn("Persistent context failed:", e.message);
+  }
+  const browser = await chromium.launch({ headless: false, channel: "msedge" });
+  return await browser.newContext({ viewport: { width: 1400, height: 900 } });
+}
+
+async function gotoHome(page) {
+  await page.goto(cfg.urls.homeNoelle, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle");
+}
+
+async function safeScreenshot(page, nameSuffix = "") {
+  try {
+    const filename = path.join(ERR_DIR, `${ts().replace(/[: ]/g,"")}${nameSuffix}.png`);
+    await page.screenshot({ path: filename, fullPage: true });
+    console.log("Saved screenshot:", filename);
+    return filename;
+  } catch (e) {
+    console.warn("screenshot failed:", e.message);
+    return null;
+  }
+}
+
+async function clickIf(page, selector) {
+  try {
+    const loc = page.locator(selector);
+    if (await loc.count()) {
+      await loc.first().click({ force: true });
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+/* --------------------------
+   Robust switchUser (same approach as before)
+--------------------------- */
+async function switchUser(page, who) {
+  console.log(`→ switchUser: choose "${who}"`);
+  await clickIf(page, cfg.sel.switchLink);
+  await sleep(300);
+  await page.waitForSelector('text=Switch View', { timeout: 6000 }).catch(()=>{});
+
+  const openerCandidates = [
+    'div[role="dialog"] >> text="Select..."',
+    'div[role="dialog"] >> text=Select',
+    'div[role="dialog"] >> .select__control',
+    'div[role="dialog"] >> button[aria-haspopup="listbox"]',
+    'div[role="dialog"] >> [role="combobox"]'
+  ];
+
+  let opened = false;
+  for (const s of openerCandidates) {
+    try {
+      const loc = page.locator(s);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        opened = true;
+        await sleep(220);
+        break;
+      }
+    } catch (e) {}
+  }
+
+  if (!opened) {
+    try {
+      const dialog = page.locator('div[role="dialog"]').first();
+      if (await dialog.count()) {
+        const box = await dialog.boundingBox();
+        if (box) {
+          await page.mouse.click(box.x + box.width - 60, box.y + 60, { force: true });
+          opened = true;
+          await sleep(250);
+        }
+      }
+    } catch (e) {}
+  }
+
+  await sleep(220);
+
+  const optionSelectors = [
+    `div[role="option"]:has-text("${who}")`,
+    `div[role="dialog"] >> text="${who}"`,
+    `text="${who}"`,
+    `li:has-text("${who}")`,
+    `div:has-text("${who}")`
+  ];
+
+  for (const sel of optionSelectors) {
+    try {
+      const loc = page.locator(sel);
+      if (await loc.count()) {
+        await loc.first().click({ force: true });
+        console.log("   clicked option via selector:", sel);
+        await sleep(150);
+        await clickIf(page, cfg.sel.switchConfirm);
+        await page.waitForLoadState("networkidle").catch(()=>{});
+        await sleep(600);
+        return;
+      }
+    } catch (e) {}
+  }
+
+  const shot = await safeScreenshot(page, "-switch-failed");
+  await saveText("switch-error.txt", `Could not select "${who}" in Switch dialog. Screenshot: ${shot}\n`);
+  throw new Error(`switchUser: unable to select "${who}". Screenshot: ${shot}`);
+}
+
+/* -------------------------
+   Find the correct search input (defensive)
+-------------------------- */
+async function findSearchInput(page, timeout = 15000) {
+  const placeholderCandidates = [
+    'input[placeholder*="Search by request ID"]',
+    'input[placeholder*="Search by request"]',
+    'input[placeholder*="Search"]'
+  ];
+
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    for (const sel of placeholderCandidates) {
+      try {
+        const loc = page.locator(sel);
+        if (await loc.count()) {
+          const count = await loc.count();
+          for (let i = 0; i < count; i++) {
+            const l = loc.nth(i);
+            if (await l.isVisible().catch(()=>false)) {
+              return l;
+            }
+          }
+        }
+      } catch (e){}
+    }
+
+    // fallback: find input inside search container
+    try {
+      const container = page.locator('div[id^="Search-"], div.react-select, div.search-container').first();
+      if (await container.count()) {
+        const innerInput = container.locator('input').first();
+        if (await innerInput.count() && await innerInput.isVisible().catch(()=>false)) {
+          return innerInput;
+        }
+      }
+    } catch (e){}
+
+    await sleep(300);
+  }
+
+  throw new Error("Search input not found on page");
+}
+
+/* -------------------------
+   Clear + fill search input safely
+-------------------------- */
+async function fillSearch(page, inputLocator, id) {
+  try {
+    await inputLocator.scrollIntoViewIfNeeded();
+    await inputLocator.click({ clickCount: 3, force: true }).catch(()=>{});
+    await inputLocator.fill(""); // clear
+    await sleep(120);
+    await inputLocator.fill(id);
+    await sleep(250);
+    try {
+      await inputLocator.press('Enter');
+    } catch {}
+    await clickIf(page, cfg.sel.searchBtn);
+  } catch (e) {
+    throw new Error("fillSearch failed: " + e.message);
+  }
+}
+
+/* -------------------------
+   Wait up to N ms for a row result to appear
+-------------------------- */
+async function waitForResultRow(page, id, maxMs = 30000) {
+  const sel = cfg.sel.rowById(id);
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const count = await page.locator(sel).count().catch(()=>0);
+    if (count > 0) {
+      for (let i = 0; i < count; i++) {
+        const l = page.locator(sel).nth(i);
+        if (await l.isVisible().catch(()=>false)) {
+          return l;
+        }
+      }
+    }
+    await sleep(600);
+  }
+  return null;
+}
+
+/* -------------------------
+   Wait for visible confirmation after approve click
+   Looks for row disappearance, bottom "x selected" counter or toast
+-------------------------- */
+async function waitForApprovalConfirmation(page, rowLocator, timeoutMs = 20000) {
+  const start = Date.now();
+
+  const bottomCounterSelectors = [
+    'text=/\\d+\\s+selected/',
+    'div[role="status"] >> text=success',
+    'div.toast-success',
+    'div[role="alert"]'
+  ];
+
+  const rowGone = async () => {
+    try {
+      return !(await rowLocator.isVisible().catch(()=>false));
+    } catch (e) { return false; }
+  };
+
+  while (Date.now() - start < timeoutMs) {
+    if (await rowGone()) return { success: true, reason: "row_disappeared" };
+
+    for (const sel of bottomCounterSelectors) {
+      try {
+        const loc = page.locator(sel);
+        if (await loc.count() && await loc.first().isVisible().catch(()=>false)) {
+          return { success: true, reason: `signal:${sel}` };
+        }
+      } catch (e){}
+    }
+
+    await sleep(400);
+  }
+
+  return { success: false, reason: "timeout_no_confirmation" };
+}
+
+/* -------------------------
+   Click the in-row approve button (robust)
+-------------------------- */
+async function clickRowApproveButton(page, rowLocator) {
+  let rowHtml = "";
+  try {
+    rowHtml = await rowLocator.evaluate(el => el.outerHTML).catch(()=>"");
+  } catch (e) { rowHtml = ""; }
+
+  const candidateSelectors = [
+    'span[title="Approve"] button',
+    'span[title="Approve"]',
+    'button[aria-label="Approve"]',
+    'button[title="Approve"]',
+    'button:has-text("✓")',
+    'button:has-text("Approve")',
+    'button.btn.btn-secondary',
+    'button'
+  ];
+
+  for (const sel of candidateSelectors) {
+    try {
+      const btn = rowLocator.locator(sel).first();
+      if (await btn.count() && await btn.isVisible().catch(()=>false)) {
+        await btn.scrollIntoViewIfNeeded();
+        await btn.click({ force: true });
+        const conf = await waitForApprovalConfirmation(page, rowLocator, 20000);
+        if (conf.success) return { clicked: true, success: true, reason: conf.reason };
+      }
+    } catch (e) {
+      // continue
+    }
+  }
+
+  // fallback: click near right edge of row
+  try {
+    const box = await rowLocator.boundingBox();
+    if (box) {
+      const clickX = box.x + Math.max(box.width - 36, Math.floor(box.width * 0.85));
+      const clickY = box.y + box.height / 2;
+      await page.mouse.click(clickX, clickY, { force: true });
+      const conf = await waitForApprovalConfirmation(page, rowLocator, 20000);
+      if (conf.success) return { clicked: true, success: true, reason: conf.reason || "clicked_coords" };
+    }
+  } catch (e) {}
+
+  // save debugging artifacts
+  const shot = await safeScreenshot(page, `-approve-click-failed`);
+  const dumpName = `row-html-${ts()}.html`;
+  await saveText(dumpName, rowHtml, ERR_DIR);
+  return { clicked: false, success: false, reason: "no_selector_matched", screenshot: shot, rowDump: dumpName };
+}
+
+/* -------------------------
+   Process a single request id:
+   - search for it (current page)
+   - if found, click in-row approve button and wait ~15s after confirmation
+   - returns result object
+-------------------------- */
+async function processSingleRequest(page, id) {
+  // find fresh input each time
+  const inputLoc = await findSearchInput(page, 8000).catch(()=>null);
+  if (!inputLoc) throw new Error("Search input not found");
+
+  await fillSearch(page, inputLoc, id);
+
+  const row = await waitForResultRow(page, id, 20000);
+  if (!row) {
+    return { found: false };
+  }
+
+  // click in-row approve
+  const res = await clickRowApproveButton(page, row);
+
+  if (!res.clicked) {
+    return { found: true, clicked: false, debug: res };
+  }
+
+  if (!res.success) {
+    return { found: true, clicked: true, success: false, debug: res };
+  }
+
+  // per your instruction: after confirmation wait additional 15 seconds, then continue
+  await sleep(15000);
+
+  // clear search input
+  try { await inputLoc.fill(""); } catch (e) {}
+
+  return { found: true, clicked: true, success: true, reason: res.reason };
+}
+
+/* -------------------------
+   MAIN flow
+-------------------------- */
+async function main() {
+  const input = process.argv[2] || "requests.csv";
+  if (!fs.existsSync(input)) { console.error("requests.csv missing"); return; }
+  const ids = readRequests(input);
+
+  const outPath = path.join(LOGS_DIR, `run-${ts().replace(/[: ]/g,"")}.csv`);
+  appendLog(outPath, "time,request_id,result,notes\n");
+
+  const context = await startBrowser();
+  const page = await context.newPage();
+
+  try {
+    await gotoHome(page);
+
+    // ensure starting user is Noelle
+    const body = await page.textContent("body").catch(()=>"");
+    if (!body.includes(cfg.users.noelle.split(",")[0]) && !body.includes("Eder")) {
+      try { await switchUser(page, cfg.users.noelle); } catch(e) { console.warn("switch to noelle failed:", e.message); }
+    }
+
+    let currentUser = cfg.users.noelle;
+    for (const id of ids) {
+      process.stdout.write(`Processing ${id} ... `);
+
+      // try in current user first
+      let r = await processSingleRequest(page, id).catch(e => ({ error: e.message }));
+      if (r && r.error) {
+        console.error(`ERROR searching ${id}: ${r.error}`);
+        appendLog(outPath, `${ts()},${id},error,${r.error}\n`);
+        continue;
+      }
+
+      if (!r.found) {
+        // switch user and retry
+        const other = currentUser === cfg.users.noelle ? cfg.users.alvaro : cfg.users.noelle;
+        console.log(`Not found for ${currentUser}. Switching to ${other}...`);
+        try {
+          await switchUser(page, other);
+          currentUser = other;
+        } catch (e) {
+          console.error("switchUser failed:", e.message);
+          appendLog(outPath, `${ts()},${id},error,switchUserFailed:${e.message}\n`);
+          continue;
+        }
+
+        r = await processSingleRequest(page, id).catch(e => ({ error: e.message }));
+        if (r && r.error) {
+          console.error(`ERROR searching ${id} after switch: ${r.error}`);
+          appendLog(outPath, `${ts()},${id},error,${r.error}\n`);
+          continue;
+        }
+      }
+
+      // at this point r.found === true or still not found
+      if (!r.found) {
+        console.log(`Not found anywhere: ${id}`);
+        appendLog(outPath, `${ts()},${id},not_found,not found in either user\n`);
+        // switch back to Noelle for next id (so we always start from Noelle)
+        if (currentUser !== cfg.users.noelle) {
+          try { await switchUser(page, cfg.users.noelle); currentUser = cfg.users.noelle; } catch(e){}
+        }
+        continue;
+      }
+
+      if (r.found && r.clicked && r.success) {
+        console.log(`approved in ${currentUser}`);
+        appendLog(outPath, `${ts()},${id},approved,approved_in_${currentUser.replace(/[, ]+/g,"_")}\n`);
+        // ensure we continue searching from Noelle for next id
+        if (currentUser !== cfg.users.noelle) {
+          try { await switchUser(page, cfg.users.noelle); currentUser = cfg.users.noelle; } catch(e){}
+        }
+        continue;
+      }
+
+      // found but click didn't work
+      if (r.found && (!r.clicked || !r.success)) {
+        console.warn(`Found but approval failed for ${id}. Debug saved.`);
+        const note = r.debug && (r.debug.screenshot || r.debug.rowDump) ? `${r.debug.screenshot || ""};${r.debug.rowDump || ""}` : "no-debug";
+        appendLog(outPath, `${ts()},${id},found_but_failed,${note}\n`);
+        // try to reset to Noelle for next id
+        if (currentUser !== cfg.users.noelle) {
+          try { await switchUser(page, cfg.users.noelle); currentUser = cfg.users.noelle; } catch(e){}
+        }
+        continue;
+      }
+    }
+
+    console.log("Done. Log:", outPath);
+    await context.close();
+  } catch (err) {
+    console.error("Fatal error:", err.message);
+    const shot = await safeScreenshot(page, "-fatal");
+    await saveText("fatal-error.txt", `${err.stack}\nScreenshot: ${shot}\n`);
+    console.log("Browser left open for inspection (check logs/errors).");
+  }
+}
+
+main().catch(e => console.error("unhandled:", e));
